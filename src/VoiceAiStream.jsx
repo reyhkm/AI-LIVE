@@ -1,27 +1,46 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { GoogleGenAI, Modality } from '@google/genai';
-import './VoiceAiStream.css'; // CSS untuk styling
+import { GoogleGenerativeAI } from '@google/genai';
+import './VoiceAiStream.css';
 
 // --- Konfigurasi ---
 const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
-const LIVE_MODEL = 'gemini-1.5-flash-latest'; // Model yang mendukung audio I/O
-const SAMPLE_RATE = 16000; // Sample rate yang umum untuk speech recognition
+const MODEL_NAME = 'gemini-1.5-flash-latest';
 
-const ai = new GoogleGenAI(GEMINI_API_KEY);
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: MODEL_NAME });
+
+// Helper untuk mengubah Blob menjadi string Base64
+const blobToBase64 = (blob) => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result.split(',')[1]); // Hapus prefix data URL
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+};
 
 const VoiceAiStream = () => {
-  const [isListening, setIsListening] = useState(false);
-  const [isConnected, setIsConnected] = useState(false);
-  const [statusMessage, setStatusMessage] = useState('Klik untuk memulai');
+  const [isRecording, setIsRecording] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [statusMessage, setStatusMessage] = useState('Klik untuk merekam');
   const [transcript, setTranscript] = useState('');
 
-  // Refs untuk menyimpan objek yang tidak perlu me-render ulang komponen
-  const sessionRef = useRef(null);
-  const audioContextRef = useRef(null);
-  const processorRef = useRef(null);
+  // Refs
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
   const audioQueueRef = useRef([]);
   const isPlayingRef = useRef(false);
-  const mediaStreamRef = useRef(null);
+  const chatRef = useRef(null);
+
+  // Inisialisasi chat session saat komponen dimuat
+  useEffect(() => {
+    chatRef.current = model.startChat({
+      history: [
+        { role: 'user', parts: [{ text: "You are a helpful and responsive AI voice assistant named Gemini. Keep your answers brief and clear." }] },
+        { role: 'model', parts: [{ text: "OK, I'm ready to help! How can I assist you today?" }] }
+      ]
+    });
+  }, []);
 
   // --- Fungsi untuk Memainkan Audio dari AI ---
   const playNextInQueue = async () => {
@@ -30,10 +49,9 @@ const VoiceAiStream = () => {
     }
     isPlayingRef.current = true;
     
-    const audioData = audioQueueRef.current.shift(); // Ambil audio pertama dari antrian
+    const audioData = audioQueueRef.current.shift();
     
     try {
-      // Audio dari server adalah base64, kita perlu decode
       const audioBlob = await (await fetch(`data:audio/ogg;base64,${audioData}`)).blob();
       const audioUrl = URL.createObjectURL(audioBlob);
       const audio = new Audio(audioUrl);
@@ -41,7 +59,7 @@ const VoiceAiStream = () => {
       audio.onended = () => {
         URL.revokeObjectURL(audioUrl);
         isPlayingRef.current = false;
-        playNextInQueue(); // Mainkan audio selanjutnya jika ada
+        playNextInQueue();
       };
     } catch (error) {
       console.error("Gagal memainkan audio:", error);
@@ -50,117 +68,89 @@ const VoiceAiStream = () => {
     }
   };
 
-  // --- Fungsi untuk Menghubungkan ke Live AI ---
-  const connect = async () => {
-    setStatusMessage('Menghubungkan ke AI...');
-    try {
-      const session = await ai.getGenerativeModel({ model: LIVE_MODEL }).startChat({
-        history: [
-          {
-            role: 'user',
-            parts: [{ text: "You are a helpful and responsive AI voice assistant. Keep your answers brief and clear." }]
-          },
-          {
-            role: 'model',
-            parts: [{ text: "OK, I'm ready to help!" }]
-          }
-        ]
-      });
-      
-      const chat = session.withAudioStreaming();
-      sessionRef.current = chat;
-
-      setIsConnected(true);
-      setStatusMessage('Terhubung. Silakan bicara.');
-
-      // Start processing responses
-      (async () => {
-        for await (const chunk of chat.stream) {
-          const serverMessage = chunk;
-          if (serverMessage.text) {
-            setTranscript(prev => prev + serverMessage.text);
-          }
-          if (serverMessage.audio) {
-            audioQueueRef.current.push(serverMessage.audio);
-            playNextInQueue();
-          }
-        }
-      })().catch(e => {
-        console.error("Error processing stream:", e);
-        setStatusMessage('Error. Coba lagi.');
-        stopListening();
-      });
-
-    } catch (error) {
-      console.error("Gagal koneksi:", error);
-      setStatusMessage('Gagal terhubung. Cek API Key.');
-    }
-  };
-
-  // --- Fungsi untuk Memulai & Menghentikan Mendengarkan ---
-  const startListening = async () => {
-    if (isListening) return;
-    setIsListening(true);
-    setTranscript(''); // Reset transkrip
-    await connect();
-
+  // --- Fungsi untuk Memulai & Menghentikan Merekam ---
+  const startRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      mediaStreamRef.current = stream;
-      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
-        sampleRate: SAMPLE_RATE,
-      });
-      const source = audioContextRef.current.createMediaStreamSource(stream);
-      
-      await audioContextRef.current.audioWorklet.addModule('audio-processor.js');
-      processorRef.current = new AudioWorkletNode(audioContextRef.current, 'audio-processor');
-      source.connect(processorRef.current);
-      processorRef.current.connect(audioContextRef.current.destination);
+      mediaRecorderRef.current = new MediaRecorder(stream);
+      audioChunksRef.current = [];
 
-      processorRef.current.port.onmessage = (event) => {
-        if (sessionRef.current) {
-          sessionRef.current.sendAudio(event.data);
+      mediaRecorderRef.current.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
         }
       };
 
+      mediaRecorderRef.current.onstop = async () => {
+        setIsProcessing(true);
+        setStatusMessage('Memproses audio...');
+        setTranscript('');
+
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        const base64Audio = await blobToBase64(audioBlob);
+
+        try {
+          const result = await chatRef.current.sendMessageStream([
+            { inlineData: { mimeType: 'audio/webm', data: base64Audio } }
+          ]);
+
+          setStatusMessage('AI sedang menjawab...');
+          let fullResponse = "";
+          for await (const chunk of result.stream) {
+            const chunkText = chunk.text();
+            if (chunkText) {
+              fullResponse += chunkText;
+              setTranscript(fullResponse);
+            }
+            
+            if (chunk.candidates && chunk.candidates[0].content.parts) {
+              for (const part of chunk.candidates[0].content.parts) {
+                if (part.inlineData && part.inlineData.mimeType.startsWith('audio/')) {
+                  audioQueueRef.current.push(part.inlineData.data);
+                  playNextInQueue();
+                }
+              }
+            }
+          }
+        } catch (error) {
+          console.error("Gagal mengirim audio ke Gemini:", error);
+          setStatusMessage('Gagal memproses audio. Coba lagi.');
+        } finally {
+          setIsProcessing(false);
+          setStatusMessage('Klik untuk merekam');
+        }
+      };
+
+      mediaRecorderRef.current.start();
+      setIsRecording(true);
+      setStatusMessage('Merekam... Klik untuk berhenti.');
     } catch (error) {
-      console.error("Error mengakses mikrofon:", error);
+      console.error("Gagal mengakses mikrofon:", error);
       setStatusMessage('Gagal akses mikrofon.');
-      setIsListening(false);
     }
   };
 
-  const stopListening = () => {
-    if (!isListening) return;
-    setIsListening(false);
-    setStatusMessage('Klik untuk memulai');
-
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach(track => track.stop());
-      mediaStreamRef.current = null;
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
+      mediaRecorderRef.current.stop();
+      mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
     }
-    if (processorRef.current) {
-      processorRef.current.disconnect();
-      processorRef.current = null;
-    }
-    if (audioContextRef.current) {
-      audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
-    if (sessionRef.current) {
-      // The new SDK doesn't have a close method on the chat session itself.
-      // It closes when the stream ends or on page unload.
-      sessionRef.current = null;
-    }
-    setIsConnected(false);
+    setIsRecording(false);
   };
 
-  const handleToggleListening = () => {
-    if (isListening) {
-      stopListening();
+  const handleToggleRecording = () => {
+    if (isProcessing) return;
+    if (isRecording) {
+      stopRecording();
     } else {
-      startListening();
+      startRecording();
     }
+  };
+
+  const getButtonText = () => {
+    if (isProcessing) return 'Proses...';
+    if (isRecording) return 'Stop';
+    return 'Start';
   };
 
   return (
@@ -172,10 +162,11 @@ const VoiceAiStream = () => {
         <p>{transcript || "Transkrip akan muncul di sini..."}</p>
       </div>
       <button 
-        className={`mic-button ${isListening ? 'listening' : ''}`}
-        onClick={handleToggleListening}
+        className={`mic-button ${isRecording ? 'listening' : ''}`}
+        onClick={handleToggleRecording}
+        disabled={isProcessing}
       >
-        {isListening ? 'Stop' : 'Start'}
+        {getButtonText()}
       </button>
     </div>
   );
