@@ -1,12 +1,12 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { GoogleGenerativeAI } from '@google/genai';
+import { GenerativeAI } from '@google/genai';
 import './VoiceAiStream.css';
 
 // --- Konfigurasi ---
 const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
 const MODEL_NAME = 'gemini-1.5-flash-latest';
 
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const genAI = new GenerativeAI(GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: MODEL_NAME });
 
 // Helper untuk mengubah Blob menjadi string Base64
